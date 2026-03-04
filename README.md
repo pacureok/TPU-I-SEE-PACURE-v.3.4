@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo2.png" alt="Pacure LABS Logo" width="50%">
+  <img src="assets/logo.png" alt="Pacure LABS Logo" width="50%">
 </p>
 
 <h1 align="center">TPU / I SEE PACURE v.3.4</h1> 
