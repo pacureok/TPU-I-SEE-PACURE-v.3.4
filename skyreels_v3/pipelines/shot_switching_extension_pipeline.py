@@ -13,10 +13,10 @@ from ..modules import get_text_encoder, get_transformer, get_vae
 from ..scheduler.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from ..utils.util import get_video_info
 
-
 class ShotSwitchingExtensionPipeline:
     """
-    A pipeline for shot switching video extension tasks.
+    Pipeline diseñado para la extensión de video mediante cambio de tomas (shot switching).
+    Permite continuar un video existente basándose en frames de condición previos.
     """
 
     def __init__(
@@ -29,15 +29,22 @@ class ShotSwitchingExtensionPipeline:
         low_vram=False,
     ):
         """
-        Initialize the diffusion forcing pipeline class
+        Inicializa los componentes del pipeline de extensión.
 
         Args:
-            model_path (str): Path to the model
-            device (str): Device to run on, defaults to 'cuda'
-            weight_dtype: Weight data type, defaults to torch.bfloat16
+            model_path (str): Ruta raíz de los checkpoints del modelo.
+            device (str): Dispositivo de ejecución (ej. 'cuda').
+            weight_dtype: Tipo de dato de los pesos (bfloat16 recomendado).
+            use_usp: Activa el paralelismo de secuencia (Ultra Sequence Parallel).
+            offload: Mueve modelos a CPU cuando no se usan para ahorrar VRAM.
+            low_vram: Optimización agresiva de memoria.
         """
-        offload = offload or low_vram
-        load_device = "cpu" if offload else device
+        self.offload = offload or low_vram
+        self.low_vram = low_vram
+        self.device = device
+        load_device = "cpu" if self.offload else device
+        
+        # 1. Cargar Transformer (Específico para Shot Switching)
         self.transformer = get_transformer(
             model_path,
             subfolder="shot_transformer",
@@ -45,52 +52,47 @@ class ShotSwitchingExtensionPipeline:
             weight_dtype=weight_dtype,
             low_vram=low_vram,
         )
+
+        # 2. Cargar VAE (Wan 2.1)
         vae_model_path = os.path.join(model_path, "Wan2.1_VAE.pth")
         self.vae = get_vae(vae_model_path, device=device, weight_dtype=torch.float32)
+
+        # 3. Cargar Text Encoder (T5)
         self.text_encoder = get_text_encoder(
             model_path, device=load_device, weight_dtype=weight_dtype
         )
+
         self.video_processor = VideoProcessor(vae_scale_factor=16)
-        self.device = device
-        self.offload = offload
-        self.low_vram = low_vram
         self.sp_size = 1
 
+        # Configuración de USP (Ultra Sequence Parallel)
         if use_usp:
             import types
-
             from xfuser.core.distributed import get_sequence_parallel_world_size
-
             from ..distributed.context_parallel_for_extension import (
                 usp_attn_forward,
                 usp_dit_forward,
             )
 
             for block in self.transformer.blocks:
-                block.self_attn.forward = types.MethodType(
-                    usp_attn_forward, block.self_attn
-                )
-                self.transformer.forward = types.MethodType(
-                    usp_dit_forward, self.transformer
-                )
-                self.sp_size = get_sequence_parallel_world_size()
+                block.self_attn.forward = types.MethodType(usp_attn_forward, block.self_attn)
+            
+            self.transformer.forward = types.MethodType(usp_dit_forward, self.transformer)
+            self.sp_size = get_sequence_parallel_world_size()
 
+        # Scheduler y parámetros de arquitectura
         self.scheduler = FlowUniPCMultistepScheduler()
-        self.vae_stride = (4, 8, 8)
+        self.vae_stride = (4, 8, 8)  # Temporal, Height, Width
         self.patch_size = (1, 2, 2)
-        self.components = {
-            "vae": self.vae.vae,
-            "text_encoder": self.text_encoder,
-            "transformer": self.transformer,
-        }
-        self.offload = offload
+
+        # Gestión de dispositivos inicial
         self.vae.to(self.device)
-        if self.offload:
-            self.text_encoder.to("cpu")
-            self.transformer.to("cpu")
-        else:
+        if not self.offload:
             self.text_encoder.to(self.device)
             self.transformer.to(self.device)
+        else:
+            self.text_encoder.to("cpu")
+            self.transformer.to("cpu")
 
     def extend_video(
         self,
@@ -101,16 +103,25 @@ class ShotSwitchingExtensionPipeline:
         fps: int = 24,
         resolution: str = "720P",
     ):
-        assert (
-            duration in SHOT_NUM_CONDITION_FRAMES_MAP
-        ), f"Duration {duration} not supported"
+        """
+        Función de alto nivel para extender un archivo de video.
+        """
+        if duration not in SHOT_NUM_CONDITION_FRAMES_MAP:
+            raise ValueError(f"Duración {duration} no soportada por el mapa de frames de condición.")
+
         num_condition_frames = SHOT_NUM_CONDITION_FRAMES_MAP[duration]
         frames_num = duration * fps + 1
-        prefix_video, raw_video, height, width = get_video_info(
+
+        # Obtener frames de prefijo y dimensiones
+        prefix_video, _, height, width = get_video_info(
             raw_video, num_condition_frames, resolution
         )
+
+        # Codificar video de prefijo a espacio latente
         prefix_video = prefix_video.to(self.device)
-        prefix_video = self.vae.encode(prefix_video)
+        prefix_latents = self.vae.encode(prefix_video)
+
+        # Generar extensión
         video_frames = self.__call__(
             prompt=prompt,
             negative_prompt="",
@@ -121,10 +132,11 @@ class ShotSwitchingExtensionPipeline:
             guidance_scale=1.0,
             shift=8.0,
             generator=torch.Generator(device=self.device).manual_seed(seed),
-            prefix_video=prefix_video,
+            prefix_video=prefix_latents,
             block_offload=self.low_vram,
         )[0]
-        logging.info(f"video_frames: {video_frames.shape}")
+
+        logging.info(f"Video extendido generado con éxito. Shape: {video_frames.shape}")
         return video_frames
 
     @property
@@ -147,100 +159,95 @@ class ShotSwitchingExtensionPipeline:
         **kwargs,
     ):
         self._guidance_scale = guidance_scale
+        
+        # 1. Procesar Texto
         if self.offload:
             self.text_encoder.to(self.device)
-        # preprocess
-        F = num_frames
-        target_shape = (
-            self.vae.vae.z_dim,
-            (F - 1) // self.vae_stride[0] + 1,
-            height // self.vae_stride[1],
-            width // self.vae_stride[2],
-        )
+        
         context = self.text_encoder.encode(prompt).to(self.device)
         context_null = (
             self.text_encoder.encode(negative_prompt).to(self.device)
-            if self.do_classifier_free_guidance
-            else None
+            if self.do_classifier_free_guidance else None
         )
+
         if self.offload:
             self.text_encoder.to("cpu")
             gc.collect()
             torch.cuda.empty_cache()
 
-        latents = [
-            torch.randn(
-                target_shape[0],
-                target_shape[1],
-                target_shape[2],
-                target_shape[3],
-                dtype=torch.float32,
-                device=self.device,
-                generator=generator,
-            )
-        ]
+        # 2. Preparar Latentes
+        target_shape = (
+            self.vae.vae.z_dim,
+            (num_frames - 1) // self.vae_stride[0] + 1,
+            height // self.vae_stride[1],
+            width // self.vae_stride[2],
+        )
+
+        latents = torch.randn(
+            *target_shape,
+            dtype=torch.float32,
+            device=self.device,
+            generator=generator,
+        ).unsqueeze(0) # Batch dimension
 
         prefix_video = kwargs["prefix_video"].to(self.device)
-
         context_frames = prefix_video.shape[2]
-        total_frames = latents[0].shape[1] + context_frames
+        total_frames = latents.shape[2] + context_frames
 
+        # 3. Denoising Loop
         if self.offload and not block_offload:
             self.transformer.to(self.device)
-        else:
-            self.transformer.to("cpu")
-        with torch.cuda.amp.autocast(dtype=self.transformer.dtype), torch.no_grad():
-            self.scheduler.set_timesteps(
-                num_inference_steps, device=self.device, shift=shift
-            )
+
+        with torch.cuda.amp.autocast(dtype=self.transformer.dtype):
+            self.scheduler.set_timesteps(num_inference_steps, device=self.device, shift=shift)
             timesteps = self.scheduler.timesteps
 
-            for _, t in enumerate(tqdm(timesteps)):
-                latent_model_input = torch.stack(latents)
-                timestep = t.repeat(latent_model_input.shape[0])
-                timestep = timestep.unsqueeze(-1).repeat(1, total_frames)
-                timestep[:, -context_frames:] = 0
-                if guidance_scale > 1.0:
+            for t in tqdm(timesteps, desc="Extending video"):
+                # Preparar entrada de tiempo con máscara para el prefijo (t=0 para frames conocidos)
+                t_input = t.repeat(latents.shape[0]).unsqueeze(-1).repeat(1, total_frames)
+                t_input[:, -context_frames:] = 0 
+
+                if self.do_classifier_free_guidance:
                     noise_pred_cond = self.transformer(
-                        [latent_model_input, prefix_video], t=timestep, context=context, block_offload=block_offload
+                        [latents, prefix_video], t=t_input, context=context, block_offload=block_offload
                     )[0]
                     noise_pred_uncond = self.transformer(
-                        [latent_model_input, prefix_video],
-                        t=timestep,
-                        context=context_null,
-                        block_offload=block_offload,
+                        [latents, prefix_video], t=t_input, context=context_null, block_offload=block_offload
                     )[0]
-                    noise_pred = noise_pred_uncond + guidance_scale * (
-                        noise_pred_cond - noise_pred_uncond
-                    )
+                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
                 else:
                     noise_pred = self.transformer(
-                        [latent_model_input, prefix_video], t=timestep, context=context, block_offload=block_offload
+                        [latents, prefix_video], t=t_input, context=context, block_offload=block_offload
                     )
-                    # Check if the output is a tuple or a tensor
                     if isinstance(noise_pred, tuple):
                         noise_pred = noise_pred[0]
 
-                temp_x0 = self.scheduler.step(
-                    noise_pred,
-                    t,
-                    latents[0].unsqueeze(0),
-                    return_dict=False,
-                    generator=generator,
+                # Paso del Scheduler
+                latents = self.scheduler.step(
+                    noise_pred, t, latents, return_dict=False, generator=generator
                 )[0]
-                latents = [temp_x0.squeeze(0)]
+
                 if block_offload:
                     gc.collect()
                     torch.cuda.empty_cache()
-            if self.offload:
-                self.transformer.cpu()
-                torch.cuda.empty_cache()
-            videos = self.vae.decode(latents[0])
-            videos = (videos / 2 + 0.5).clamp(0, 1)
-            videos = [video for video in videos]
-            videos = [video.permute(1, 2, 3, 0) * 255 for video in videos]
-            videos = [video.cpu().numpy().astype(np.uint8) for video in videos]
+
+        if self.offload:
+            self.transformer.cpu()
+            torch.cuda.empty_cache()
+
+        # 4. Decodificación Final
+        videos = self.vae.decode(latents[0])
+        videos = (videos / 2 + 0.5).clamp(0, 1)
+        
+        # Post-procesamiento a formato imagen/video
+        final_videos = []
+        for video in videos:
+            # Reordenar: [C, F, H, W] -> [F, H, W, C]
+            video = video.permute(1, 2, 3, 0) * 255
+            final_videos.append(video.cpu().numpy().astype(np.uint8))
+
         if self.offload:
             gc.collect()
             torch.cuda.empty_cache()
-        return videos
+
+        return final_videos
